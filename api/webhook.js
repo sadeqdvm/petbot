@@ -1,5 +1,5 @@
 const axios = require("axios");
-
+const processedMessages = new Set();
 // ======================================================
 // ENV VARIABLES
 // ======================================================
@@ -403,7 +403,16 @@ module.exports = async (req, res) => {
       }
 
       const message = value.messages[0];
-
+      // Ignore duplicate messages
+      if (processedMessages.has(messageId)) {
+      
+        console.log("Duplicate message ignored");
+      
+        return res.sendStatus(200);
+      }
+      
+      processedMessages.add(messageId);
+	  const messageId = message.id;
       // ================================================
       // IGNORE INVALID EVENTS
       // ================================================
@@ -468,10 +477,11 @@ module.exports = async (req, res) => {
       console.log("TEXT:", text);
       console.log("================================");
 
-      // Process bot logic
-      await handleMessage(from, text, type);
-
-      return res.sendStatus(200);
+      // Respond to Meta IMMEDIATELY
+      res.sendStatus(200);
+      
+      // Process asynchronously
+      handleMessage(from, text, type);
 
     } catch (error) {
 
