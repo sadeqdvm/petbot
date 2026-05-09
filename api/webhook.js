@@ -9,13 +9,130 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
 const VET_NUMBER = "8801721417598";
+const PROCESSED_MESSAGE_TTL_MS = 15 * 60 * 1000;
+const STALE_MESSAGE_MAX_AGE_MS = 5 * 60 * 1000;
+const DUPLICATE_FINGERPRINT_TTL_MS = 2 * 60 * 1000;
+const MAX_PROCESSED_MESSAGES = 1000;
 
 // ======================================================
 // TEMP MEMORY
 // ======================================================
 
 const users = {};
-const processedMessages = new Set();
+const processedMessages = new Map();
+
+// ======================================================
+// MESSAGE SAFETY HELPERS
+// ======================================================
+
+function pruneProcessedMessages(now = Date.now()) {
+
+  for (const [messageId, expiresAt] of processedMessages) {
+
+    if (expiresAt <= now || processedMessages.size > MAX_PROCESSED_MESSAGES) {
+      processedMessages.delete(messageId);
+    }
+  }
+}
+
+function hasRecentlyProcessedMessage(messageId, now = Date.now()) {
+
+  if (!messageId) {
+    return false;
+  }
+
+  pruneProcessedMessages(now);
+
+  const expiresAt = processedMessages.get(messageId);
+
+  if (expiresAt && expiresAt > now) {
+    return true;
+  }
+
+  processedMessages.set(messageId, now + PROCESSED_MESSAGE_TTL_MS);
+
+  return false;
+}
+
+function isStaleMessage(message, now = Date.now()) {
+
+  const timestampSeconds = Number(message?.timestamp);
+
+  if (!Number.isFinite(timestampSeconds)) {
+    return false;
+  }
+
+  return now - (timestampSeconds * 1000) > STALE_MESSAGE_MAX_AGE_MS;
+}
+
+function buildMessageFingerprint(message, text) {
+
+  return [
+    message.from || "",
+    message.type || "",
+    text || "",
+    message.image?.id || "",
+    message.document?.id || ""
+  ].join(":");
+}
+
+function isDuplicateUserInput(user, fingerprint, now = Date.now()) {
+
+  if (!fingerprint) {
+    return false;
+  }
+
+  if (
+    user.lastInboundFingerprint === fingerprint &&
+    user.lastInboundAt &&
+    now - user.lastInboundAt < DUPLICATE_FINGERPRINT_TTL_MS
+  ) {
+    return true;
+  }
+
+  user.lastInboundFingerprint = fingerprint;
+  user.lastInboundAt = now;
+
+  return false;
+}
+
+
+function isPetAnswer(text) {
+
+  const value = (text || "").trim().toLowerCase();
+  const petAnswers = [
+    "1",
+    "2",
+    "3",
+    "4",
+    "বিড়াল",
+    "বিড়াল",
+    "কুকুর",
+    "পাখি",
+    "অন্যান্য",
+    "cat",
+    "dog",
+    "bird",
+    "other"
+  ];
+
+  return petAnswers.includes(value);
+}
+
+function createUser() {
+
+  return {
+    state: "ASK_PET",
+    petType: "",
+    problem: "",
+    duration: "",
+    temperature: "",
+    paid: false,
+    paymentMessageId: "",
+    lastInboundFingerprint: "",
+    lastInboundAt: 0
+  };
+}
 
 // ======================================================
 // SEND MESSAGE
@@ -108,29 +225,24 @@ function isEmergency(text) {
 // MAIN BOT LOGIC
 // ======================================================
 
-async function handleMessage(userId, message, type) {
+async function handleMessage(userId, message, type, messageId) {
 
   let user = users[userId];
-
-  // ==========================================
-  // NEW USER
-  // ==========================================
+  const isNewUser = !user;
 
   if (!user) {
+    user = createUser();
+    users[userId] = user;
+  }
 
-    users[userId] = {
-      state: "ASK_PET",
-      petType: "",
-      problem: "",
-      duration: "",
-      temperature: "",
-      paid: false
-    };
+  const fingerprint = buildMessageFingerprint(
+    { from: userId, type },
+    message
+  );
 
-    await sendMessage(
-      userId,
-      "আসসালামু আলাইকুম 🐶🐱\n\nআপনার পোষা প্রাণীটি কী?\n\n১. বিড়াল\n২. কুকুর\n৩. পাখি\n৪. অন্যান্য"
-    );
+  if (isDuplicateUserInput(user, fingerprint)) {
+
+    console.log("Duplicate user input ignored:", userId, fingerprint);
 
     return;
   }
@@ -145,6 +257,26 @@ async function handleMessage(userId, message, type) {
   console.log("MESSAGE:", message);
   console.log("TYPE:", type);
   console.log("================================");
+
+  if (isNewUser && (type !== "text" || !isPetAnswer(message))) {
+
+    await sendMessage(
+      userId,
+      "আসসালামু আলাইকুম 🐶🐱\n\nআপনার পোষা প্রাণীটি কী?\n\n১. বিড়াল\n২. কুকুর\n৩. পাখি\n৪. অন্যান্য"
+    );
+
+    return;
+  }
+
+  if (type !== "text" && !(user.state === "WAIT_PAYMENT" && type === "image")) {
+
+    await sendMessage(
+      userId,
+      "অনুগ্রহ করে টেক্সট মেসেজ পাঠান।"
+    );
+
+    return;
+  }
 
   // ==========================================
   // STATES
@@ -164,7 +296,9 @@ async function handleMessage(userId, message, type) {
 
       await sendMessage(
         userId,
-        "🩺 আপনার পোষা প্রাণীর কী সমস্যা হচ্ছে?"
+        isNewUser
+          ? "আসসালামু আলাইকুম 🐶🐱\n\n🩺 আপনার পোষা প্রাণীর কী সমস্যা হচ্ছে?"
+          : "🩺 আপনার পোষা প্রাণীর কী সমস্যা হচ্ছে?"
       );
 
       break;
@@ -240,7 +374,15 @@ async function handleMessage(userId, message, type) {
 
       if (type === "image") {
 
+        if (user.paid) {
+
+          console.log("Payment already confirmed, duplicate image ignored:", userId);
+
+          break;
+        }
+
         user.paid = true;
+        user.paymentMessageId = messageId || "";
 
         user.state = "DOCTOR";
 
@@ -277,10 +419,7 @@ async function handleMessage(userId, message, type) {
 
     case "END":
 
-      await sendMessage(
-        userId,
-        "ধন্যবাদ ❤️"
-      );
+      console.log("Conversation already ended:", userId);
 
       break;
 
@@ -332,58 +471,68 @@ module.exports = async (req, res) => {
 
     try {
 
-      const entry = req.body.entry?.[0];
-      const changes = entry?.changes?.[0];
-      const value = changes?.value;
+      const entries = req.body.entry || [];
 
-      // Ignore statuses
-      if (!value?.messages) {
-        return res.sendStatus(200);
+      for (const entry of entries) {
+
+        const changes = entry?.changes || [];
+
+        for (const change of changes) {
+
+          const value = change?.value;
+
+          // Ignore statuses and other non-message webhook events.
+          if (!value?.messages) {
+            continue;
+          }
+
+          for (const message of value.messages) {
+
+            // ======================================
+            // DEDUPLICATION
+            // ======================================
+
+            const messageId = message.id;
+
+            if (hasRecentlyProcessedMessage(messageId)) {
+
+              console.log("Duplicate ignored:", messageId);
+
+              continue;
+            }
+
+            if (isStaleMessage(message)) {
+
+              console.log("Stale message ignored:", messageId, message.timestamp);
+
+              continue;
+            }
+
+            // ======================================
+            // IGNORE OWN
+            // ======================================
+
+            if (message.from_me) {
+              continue;
+            }
+
+            const from = message.from;
+            const type = message.type;
+
+            let text = "";
+
+            if (type === "text") {
+              text = message.text?.body?.trim() || "";
+            }
+
+            console.log("FROM:", from);
+            console.log("TYPE:", type);
+            console.log("TEXT:", text);
+
+            await handleMessage(from, text, type, messageId);
+          }
+        }
       }
-
-      const message = value.messages[0];
-
-      // ======================================
-      // DEDUPLICATION
-      // ======================================
-
-      const messageId = message.id;
-
-      if (processedMessages.has(messageId)) {
-
-        console.log("Duplicate ignored:", messageId);
-
-        return res.sendStatus(200);
-      }
-
-      processedMessages.add(messageId);
-
-      setTimeout(() => {
-        processedMessages.delete(messageId);
-      }, 60000);
-
-      // ======================================
-      // IGNORE OWN
-      // ======================================
-
-      if (message.from_me) {
-        return res.sendStatus(200);
-      }
-
-      const from = message.from;
-      const type = message.type;
-
-      let text = "";
-
-      if (type === "text") {
-        text = message.text?.body || "";
-      }
-
-      console.log("FROM:", from);
-      console.log("TYPE:", type);
-      console.log("TEXT:", text);
-
-      await handleMessage(from, text, type);
 
       return res.sendStatus(200);
 
