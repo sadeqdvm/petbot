@@ -18,6 +18,8 @@ const VET_NUMBER = "8801721417598";
 
 const users = {};
 const processedMessages = new Set();
+const inFlightMessages = new Set();
+const INBOUND_PROCESSING_STALE_SECONDS = Number(process.env.INBOUND_PROCESSING_STALE_SECONDS || 300);
 
 // ======================================================
 // SUPABASE REST HELPERS
@@ -107,13 +109,58 @@ async function saveUser(userId, user) {
   }
 }
 
-async function recordInboundMessage(message) {
+async function beginInboundMessageProcessing(message) {
   const messageId = message.id;
 
-  if (processedMessages.has(messageId)) {
+  if (!messageId) {
+    return true;
+  }
+
+  if (processedMessages.has(messageId) || inFlightMessages.has(messageId)) {
     return false;
   }
 
+  inFlightMessages.add(messageId);
+
+  if (!supabaseEnabled) {
+    return true;
+  }
+
+  try {
+    const response = await axios.post(
+      `${supabaseRestUrl}/rpc/claim_inbound_message`,
+      {
+        p_message_id: messageId,
+        p_user_id: message.from,
+        p_message_type: message.type,
+        p_message_text: message.text?.body || null,
+        p_payload: message,
+        p_stale_after_seconds: INBOUND_PROCESSING_STALE_SECONDS
+      },
+      {
+        headers: supabaseHeaders()
+      }
+    );
+
+    if (!response.data) {
+      console.log("Duplicate or active message ignored:", messageId);
+      inFlightMessages.delete(messageId);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error("SUPABASE MESSAGE CLAIM ERROR:", error.response?.data || error.message);
+    return true;
+  }
+}
+
+async function markInboundMessageProcessed(messageId) {
+  if (!messageId) {
+    return;
+  }
+
+  inFlightMessages.delete(messageId);
   processedMessages.add(messageId);
 
   setTimeout(() => {
@@ -121,33 +168,49 @@ async function recordInboundMessage(message) {
   }, 60000);
 
   if (!supabaseEnabled) {
-    return true;
+    return;
   }
 
   try {
     await axios.post(
-      `${supabaseRestUrl}/inbound_messages`,
+      `${supabaseRestUrl}/rpc/complete_inbound_message`,
       {
-        message_id: messageId,
-        user_id: message.from,
-        message_type: message.type,
-        message_text: message.text?.body || null,
-        payload: message
+        p_message_id: messageId
       },
       {
         headers: supabaseHeaders()
       }
     );
-
-    return true;
   } catch (error) {
-    if (error.response?.status === 409) {
-      console.log("Duplicate ignored:", messageId);
-      return false;
-    }
+    console.error("SUPABASE MESSAGE COMPLETE ERROR:", error.response?.data || error.message);
+  }
+}
 
-    console.error("SUPABASE MESSAGE LOG ERROR:", error.response?.data || error.message);
-    return true;
+async function markInboundMessageFailed(messageId, error) {
+  if (!messageId) {
+    return;
+  }
+
+  inFlightMessages.delete(messageId);
+  processedMessages.delete(messageId);
+
+  if (!supabaseEnabled) {
+    return;
+  }
+
+  try {
+    await axios.post(
+      `${supabaseRestUrl}/rpc/fail_inbound_message`,
+      {
+        p_message_id: messageId,
+        p_last_error: String(error.response?.data?.message || error.message || error).slice(0, 1000)
+      },
+      {
+        headers: supabaseHeaders()
+      }
+    );
+  } catch (supabaseError) {
+    console.error("SUPABASE MESSAGE FAIL ERROR:", supabaseError.response?.data || supabaseError.message);
   }
 }
 
@@ -494,6 +557,9 @@ module.exports = async (req, res) => {
 
   if (req.method === "POST") {
 
+    let message;
+    let messageClaimed = false;
+
     try {
 
       const entry = req.body.entry?.[0];
@@ -505,23 +571,23 @@ module.exports = async (req, res) => {
         return res.sendStatus(200);
       }
 
-      const message = value.messages[0];
-
-      // ======================================
-      // DEDUPLICATION
-      // ======================================
-
-      const messageRecorded = await recordInboundMessage(message);
-
-      if (!messageRecorded) {
-        return res.sendStatus(200);
-      }
+      message = value.messages[0];
 
       // ======================================
       // IGNORE OWN
       // ======================================
 
       if (message.from_me) {
+        return res.sendStatus(200);
+      }
+
+      // ======================================
+      // DEDUPLICATION / PROCESSING CLAIM
+      // ======================================
+
+      messageClaimed = await beginInboundMessageProcessing(message);
+
+      if (!messageClaimed) {
         return res.sendStatus(200);
       }
 
@@ -539,10 +605,15 @@ module.exports = async (req, res) => {
       console.log("TEXT:", text);
 
       await handleMessage(from, text, type);
+      await markInboundMessageProcessed(message.id);
 
       return res.sendStatus(200);
 
     } catch (error) {
+
+      if (messageClaimed) {
+        await markInboundMessageFailed(message?.id, error);
+      }
 
       console.error(
         "WEBHOOK ERROR:",
