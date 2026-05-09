@@ -9,13 +9,16 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
 // ======================================================
-// TEMP USER STORAGE
+// TEMP STORAGE
 // ======================================================
 
 const users = {};
 
+// Prevent duplicate webhook processing
+const processedMessages = new Set();
+
 // ======================================================
-// SEND WHATSAPP MESSAGE
+// SEND MESSAGE
 // ======================================================
 
 async function sendMessage(to, text) {
@@ -39,7 +42,7 @@ async function sendMessage(to, text) {
       }
     );
 
-    console.log("Message sent to:", to);
+    console.log("Message sent:", to);
 
   } catch (error) {
 
@@ -286,7 +289,7 @@ async function handleMessage(userId, message, type) {
 }
 
 // ======================================================
-// MAIN VERCEL FUNCTION
+// MAIN WEBHOOK FUNCTION
 // ======================================================
 
 module.exports = async (req, res) => {
@@ -301,7 +304,7 @@ module.exports = async (req, res) => {
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
 
-    console.log("Webhook verification request");
+    console.log("Verification request received");
 
     if (
       mode === "subscribe" &&
@@ -317,7 +320,7 @@ module.exports = async (req, res) => {
   }
 
   // ====================================================
-  // RECEIVE WEBHOOK EVENTS
+  // RECEIVE EVENTS
   // ====================================================
 
   if (req.method === "POST") {
@@ -337,7 +340,8 @@ module.exports = async (req, res) => {
         return res.status(200).send("OK");
       }
 
-      const message = value?.messages?.[0];
+      const message =
+        value?.messages?.[0];
 
       // Ignore empty
       if (!message) {
@@ -345,25 +349,44 @@ module.exports = async (req, res) => {
         return res.status(200).send("OK");
       }
 
+      // ==================================================
+      // PREVENT DUPLICATES
+      // ==================================================
+
+      const messageId = message.id;
+
+      if (processedMessages.has(messageId)) {
+
+        console.log("Duplicate ignored");
+
+        return res.status(200).send("OK");
+      }
+
+      processedMessages.add(messageId);
+
+      // Auto cleanup after 5 minutes
+      setTimeout(() => {
+        processedMessages.delete(messageId);
+      }, 5 * 60 * 1000);
+
+      // ==================================================
+      // MESSAGE DATA
+      // ==================================================
+
       const from = message.from;
       const type = message.type;
 
       let text = "";
 
-      // TEXT MESSAGE
       if (type === "text") {
 
         text = message.text?.body || "";
-      }
 
-      // IMAGE MESSAGE
-      else if (type === "image") {
+      } else if (type === "image") {
 
         text = "image";
-      }
 
-      // UNSUPPORTED
-      else {
+      } else {
 
         return res.status(200).send("OK");
       }
@@ -372,11 +395,17 @@ module.exports = async (req, res) => {
       console.log("TYPE:", type);
       console.log("TEXT:", text);
 
-      // Respond FAST to Meta
+      // VERY IMPORTANT:
+      // respond FAST before processing
+
       res.status(200).send("OK");
 
-      // Process bot logic
-      await handleMessage(from, text, type);
+      // Process bot
+      await handleMessage(
+        from,
+        text,
+        type
+      );
 
       return;
 
@@ -387,7 +416,9 @@ module.exports = async (req, res) => {
         error.response?.data || error.message
       );
 
-      return res.status(500).send("Server Error");
+      return res
+        .status(500)
+        .send("Server Error");
     }
   }
 
@@ -395,5 +426,7 @@ module.exports = async (req, res) => {
   // INVALID METHOD
   // ====================================================
 
-  return res.status(405).send("Method Not Allowed");
+  return res
+    .status(405)
+    .send("Method Not Allowed");
 };
