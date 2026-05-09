@@ -68,6 +68,18 @@ function ensureSupabaseConfigured() {
   }
 }
 
+function ensureWhatsAppConfigured() {
+  if (!ACCESS_TOKEN || !PHONE_NUMBER_ID) {
+    throw new Error("WhatsApp API is not configured. Set ACCESS_TOKEN and PHONE_NUMBER_ID.");
+  }
+}
+
+function ensureVerifyTokenConfigured() {
+  if (!VERIFY_TOKEN) {
+    throw new Error("Webhook verify token is not configured. Set VERIFY_TOKEN.");
+  }
+}
+
 
 function rememberProcessedMessage(messageId) {
   if (!messageId) {
@@ -256,9 +268,10 @@ async function broadcastDashboardEvent(event, payload) {
 // ======================================================
 
 async function sendMessage(to, text, options = {}) {
-  try {
-    console.log("Sending:", text);
+  ensureWhatsAppConfigured();
+  console.log("Sending:", text);
 
+  try {
     await axios.post(
       `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
       {
@@ -275,20 +288,18 @@ async function sendMessage(to, text, options = {}) {
         }
       }
     );
-
-    await recordMessage({
-      conversationId: options.conversationId || null,
-      userId: to,
-      direction: "outbound",
-      type: "text",
-      body: text
-    });
   } catch (error) {
-    console.error(
-      "SEND ERROR:",
-      error.response?.data || error.message
-    );
+    console.error("SEND ERROR:", error.response?.data || error.message);
+    throw error;
   }
+
+  await recordMessage({
+    conversationId: options.conversationId || null,
+    userId: to,
+    direction: "outbound",
+    type: "text",
+    body: text
+  });
 }
 
 async function downloadWhatsAppMedia(mediaId) {
@@ -479,7 +490,7 @@ async function handleMessage(userId, message, type, rawMessage) {
 
         await sendMessage(
           userId,
-          "⚠️ এটি জরুরি সমস্যা হতে পারে। দ্রুত নিকটস্থ ভেট ক্লিনিকে যোগাযোগ করুন।",
+          "⚠️ এটি জরুরি সমস্যা হতে পারে। এই চ্যাট জরুরি সেবার বিকল্প নয়। এখনই নিকটস্থ ২৪/৭ ভেট ক্লিনিক বা ইমার্জেন্সি হাসপাতালে যোগাযোগ করুন।",
           { conversationId: user.id }
         );
 
@@ -591,6 +602,13 @@ async function handleMessage(userId, message, type, rawMessage) {
 
 module.exports = async (req, res) => {
   if (req.method === "GET") {
+    try {
+      ensureVerifyTokenConfigured();
+    } catch (error) {
+      console.error("WEBHOOK VERIFY CONFIG ERROR:", error.message);
+      return res.sendStatus(500);
+    }
+
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
@@ -611,6 +629,8 @@ module.exports = async (req, res) => {
 
     try {
       ensureSupabaseConfigured();
+      ensureWhatsAppConfigured();
+      ensureVerifyTokenConfigured();
 
       const entry = req.body.entry?.[0];
       const changes = entry?.changes?.[0];
