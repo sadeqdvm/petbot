@@ -46,7 +46,10 @@ create table if not exists public.messages (
 
 create table if not exists public.processed_messages (
   whatsapp_message_id text primary key,
-  created_at timestamptz not null default now()
+  status text not null default 'succeeded' check (status in ('processing', 'succeeded', 'failed')),
+  error_message text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
 
 create table if not exists public.uploaded_images (
@@ -66,6 +69,7 @@ create index if not exists messages_conversation_created_idx on public.messages(
 create index if not exists messages_whatsapp_user_created_idx on public.messages(whatsapp_user_id, created_at desc);
 create index if not exists uploaded_images_conversation_idx on public.uploaded_images(conversation_id);
 create index if not exists processed_messages_created_idx on public.processed_messages(created_at);
+create index if not exists processed_messages_status_updated_idx on public.processed_messages(status, updated_at);
 
 -- Keep updated_at fresh without application-specific triggers.
 create or replace function public.set_updated_at()
@@ -86,6 +90,11 @@ for each row execute function public.set_updated_at();
 drop trigger if exists bot_conversations_set_updated_at on public.bot_conversations;
 create trigger bot_conversations_set_updated_at
 before update on public.bot_conversations
+for each row execute function public.set_updated_at();
+
+drop trigger if exists processed_messages_set_updated_at on public.processed_messages;
+create trigger processed_messages_set_updated_at
+before update on public.processed_messages
 for each row execute function public.set_updated_at();
 
 -- Helper predicates for RLS policies.

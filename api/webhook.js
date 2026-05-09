@@ -13,6 +13,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const PAYMENT_SCREENSHOT_BUCKET = process.env.PAYMENT_SCREENSHOT_BUCKET || "payment-screenshots";
 const VET_NUMBER = process.env.VET_NUMBER || "8801721417598";
+const MESSAGE_PROCESSING_TIMEOUT_MS = Number(process.env.MESSAGE_PROCESSING_TIMEOUT_MS || 5 * 60 * 1000);
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.warn("Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.");
@@ -68,7 +69,7 @@ function ensureSupabaseConfigured() {
 // SUPABASE PERSISTENCE HELPERS
 // ======================================================
 
-async function recordMessage({ whatsappMessageId, conversationId, userId, direction, type, body, rawPayload, mediaUrl }) {
+async function recordMessage({ whatsappMessageId, conversationId, userId, direction, type, body, rawPayload, mediaUrl }, options = {}) {
   const { data, error } = await supabase
     .from("messages")
     .insert({
@@ -86,6 +87,14 @@ async function recordMessage({ whatsappMessageId, conversationId, userId, direct
 
   if (error) {
     console.error("MESSAGE PERSIST ERROR:", error.message);
+
+    if (options.allowDuplicate && error.code === "23505") {
+      return null;
+    }
+
+    if (options.throwOnError) {
+      throw error;
+    }
   }
 
   await broadcastDashboardEvent("message", data || {
@@ -99,20 +108,111 @@ async function recordMessage({ whatsappMessageId, conversationId, userId, direct
   return data;
 }
 
-async function markMessageProcessed(messageId) {
-  const { error } = await supabase
-    .from("processed_messages")
-    .insert({ whatsapp_message_id: messageId });
-
-  if (error?.code === "23505") {
+function isProcessingStale(processedMessage) {
+  if (!processedMessage?.updated_at) {
     return false;
   }
+
+  return Date.now() - new Date(processedMessage.updated_at).getTime() > MESSAGE_PROCESSING_TIMEOUT_MS;
+}
+
+async function beginMessageProcessing(messageId) {
+  if (!messageId) {
+    return { shouldProcess: true, dedupeTracked: false };
+  }
+
+  const now = new Date().toISOString();
+  const { error } = await supabase
+    .from("processed_messages")
+    .insert({
+      whatsapp_message_id: messageId,
+      status: "processing",
+      error_message: null,
+      updated_at: now
+    });
+
+  if (!error) {
+    return { shouldProcess: true, dedupeTracked: true };
+  }
+
+  if (error.code !== "23505") {
+    throw error;
+  }
+
+  const { data: existingMessage, error: selectError } = await supabase
+    .from("processed_messages")
+    .select("whatsapp_message_id, status, updated_at")
+    .eq("whatsapp_message_id", messageId)
+    .single();
+
+  if (selectError) {
+    throw selectError;
+  }
+
+  if (existingMessage.status === "succeeded") {
+    return { shouldProcess: false, dedupeTracked: true, reason: "succeeded" };
+  }
+
+  if (existingMessage.status === "processing" && !isProcessingStale(existingMessage)) {
+    return { shouldProcess: false, dedupeTracked: true, reason: "processing" };
+  }
+
+  const { error: updateError } = await supabase
+    .from("processed_messages")
+    .update({
+      status: "processing",
+      error_message: null,
+      updated_at: now
+    })
+    .eq("whatsapp_message_id", messageId);
+
+  if (updateError) {
+    throw updateError;
+  }
+
+  return { shouldProcess: true, dedupeTracked: true };
+}
+
+async function markMessageSucceeded(messageId) {
+  if (!messageId) {
+    return;
+  }
+
+  const { error } = await supabase
+    .from("processed_messages")
+    .upsert({
+      whatsapp_message_id: messageId,
+      status: "succeeded",
+      error_message: null,
+      updated_at: new Date().toISOString()
+    }, { onConflict: "whatsapp_message_id" });
 
   if (error) {
     throw error;
   }
+}
 
-  return true;
+async function markMessageFailed(messageId, failure) {
+  if (!messageId) {
+    return;
+  }
+
+  const errorMessage = failure?.response?.data
+    ? JSON.stringify(failure.response.data)
+    : failure?.message || "Unknown webhook processing error";
+
+  const { error } = await supabase
+    .from("processed_messages")
+    .update({
+      status: "failed",
+      error_message: errorMessage.slice(0, 1000),
+      updated_at: new Date().toISOString()
+    })
+    .eq("whatsapp_message_id", messageId);
+
+  if (error) {
+    throw error;
+  }
 }
 
 async function getConversation(userId) {
@@ -512,6 +612,9 @@ module.exports = async (req, res) => {
   }
 
   if (req.method === "POST") {
+    let messageId = null;
+    let dedupeTracked = false;
+
     try {
       ensureSupabaseConfigured();
 
@@ -524,15 +627,23 @@ module.exports = async (req, res) => {
       }
 
       const message = value.messages[0];
-      const messageId = message.id;
-      const isNewMessage = await markMessageProcessed(messageId);
+      messageId = message.id;
 
-      if (!isNewMessage) {
-        console.log("Duplicate ignored:", messageId);
+      const processingState = await beginMessageProcessing(messageId);
+      dedupeTracked = processingState.dedupeTracked;
+
+      if (!processingState.shouldProcess) {
+        if (processingState.reason === "processing") {
+          console.log("Message is already being processed; asking Meta to retry:", messageId);
+          return res.sendStatus(500);
+        }
+
+        console.log(`Duplicate ignored (${processingState.reason}):`, messageId);
         return res.sendStatus(200);
       }
 
       if (message.from_me) {
+        await markMessageSucceeded(messageId);
         return res.sendStatus(200);
       }
 
@@ -560,9 +671,10 @@ module.exports = async (req, res) => {
         body: text,
         rawPayload: message,
         mediaUrl
-      });
+      }, { allowDuplicate: true, throwOnError: true });
 
       await handleMessage(from, text, type, message);
+      await markMessageSucceeded(messageId);
 
       return res.sendStatus(200);
     } catch (error) {
@@ -570,6 +682,14 @@ module.exports = async (req, res) => {
         "WEBHOOK ERROR:",
         error.response?.data || error.message
       );
+
+      if (dedupeTracked) {
+        try {
+          await markMessageFailed(messageId, error);
+        } catch (markError) {
+          console.error("MESSAGE DEDUPE FAILURE UPDATE ERROR:", markError.message);
+        }
+      }
 
       return res.sendStatus(500);
     }
