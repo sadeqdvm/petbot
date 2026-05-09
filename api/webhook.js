@@ -10,6 +10,17 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const PAYMENT_SCREENSHOT_BUCKET = process.env.PAYMENT_SCREENSHOT_BUCKET || "payment-screenshots";
+const VET_NUMBER = process.env.VET_NUMBER || "8801721417598";
+const INBOUND_PROCESSING_STALE_SECONDS = Number(process.env.INBOUND_PROCESSING_STALE_SECONDS || 300);
+
+const processedMessages = new Set();
+const inFlightMessages = new Set();
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.warn("Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.");
+}
 
 const supabase = createClient(SUPABASE_URL || "http://localhost:54321", SUPABASE_SERVICE_ROLE_KEY || "missing", {
   auth: {
@@ -18,101 +29,56 @@ const supabase = createClient(SUPABASE_URL || "http://localhost:54321", SUPABASE
   }
 });
 
-// ======================================================
-// TEMP MEMORY FALLBACK
-// ======================================================
-
-const users = {};
-const processedMessages = new Set();
-const inFlightMessages = new Set();
-const INBOUND_PROCESSING_STALE_SECONDS = Number(process.env.INBOUND_PROCESSING_STALE_SECONDS || 300);
-
-// ======================================================
-// SUPABASE REST HELPERS
-// ======================================================
-
-const supabaseEnabled = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
-const supabaseRestUrl = supabaseEnabled
-  ? `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1`
-  : "";
-
-function supabaseHeaders(extraHeaders = {}) {
-  return {
-    apikey: SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-    ...extraHeaders
-  };
-}
-
-function dbConversationToUser(row) {
-  if (!row) {
-    return null;
-  }
-
-  return {
-    state: row.state,
-    petType: row.pet_type || "",
-    problem: row.problem || "",
-    duration: row.duration || "",
-    temperature: row.temperature || "",
-    paid: Boolean(row.paid)
-  };
-}
-
-function userToDbConversation(userId, user) {
-  return {
-    user_id: userId,
-    state: user.state,
-    pet_type: user.petType || null,
-    problem: user.problem || null,
-    duration: user.duration || null,
-    temperature: user.temperature || null,
-    paid: Boolean(user.paid),
-    last_message_at: new Date().toISOString()
-  };
-}
-
-async function getUser(userId) {
-  if (!supabaseEnabled) {
-    return users[userId] || null;
-  }
-
-  try {
-    const response = await axios.get(
-      `${supabaseRestUrl}/conversations?user_id=eq.${encodeURIComponent(userId)}&select=*`,
-      {
-        headers: supabaseHeaders()
+function getSupabaseUserClient(accessToken) {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${accessToken}`
       }
-    );
+    },
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
+    }
+  });
+}
 
-    return dbConversationToUser(response.data?.[0]);
-  } catch (error) {
-    console.error("SUPABASE GET USER ERROR:", error.response?.data || error.message);
-    return users[userId] || null;
+async function requireSupabaseUser(req) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+
+  if (!token || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    return { user: null, client: null };
+  }
+
+  const client = getSupabaseUserClient(token);
+  const { data, error } = await client.auth.getUser(token);
+
+  if (error) {
+    console.error("SUPABASE AUTH ERROR:", error.message);
+    return { user: null, client: null };
+  }
+
+  return { user: data.user, client };
+}
+
+function ensureSupabaseConfigured() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.");
   }
 }
 
-async function saveUser(userId, user) {
-  users[userId] = user;
 
-  if (!supabaseEnabled) {
+function rememberProcessedMessage(messageId) {
+  if (!messageId) {
     return;
   }
 
-  try {
-    await axios.post(
-      `${supabaseRestUrl}/conversations?on_conflict=user_id`,
-      userToDbConversation(userId, user),
-      {
-        headers: supabaseHeaders({
-          Prefer: "resolution=merge-duplicates"
-        })
-      }
-    );
-  } catch (error) {
-    console.error("SUPABASE SAVE USER ERROR:", error.response?.data || error.message);
-  }
+  processedMessages.add(messageId);
+
+  setTimeout(() => {
+    processedMessages.delete(messageId);
+  }, 60000);
 }
 
 async function beginInboundMessageProcessing(message) {
@@ -128,37 +94,27 @@ async function beginInboundMessageProcessing(message) {
 
   inFlightMessages.add(messageId);
 
-  if (!supabaseEnabled) {
-    return true;
+  const { data, error } = await supabase.rpc("claim_inbound_message", {
+    p_message_id: messageId,
+    p_user_id: message.from,
+    p_message_type: message.type,
+    p_message_text: message.text?.body || null,
+    p_payload: message,
+    p_stale_after_seconds: INBOUND_PROCESSING_STALE_SECONDS
+  });
+
+  if (error) {
+    inFlightMessages.delete(messageId);
+    throw error;
   }
 
-  try {
-    const response = await axios.post(
-      `${supabaseRestUrl}/rpc/claim_inbound_message`,
-      {
-        p_message_id: messageId,
-        p_user_id: message.from,
-        p_message_type: message.type,
-        p_message_text: message.text?.body || null,
-        p_payload: message,
-        p_stale_after_seconds: INBOUND_PROCESSING_STALE_SECONDS
-      },
-      {
-        headers: supabaseHeaders()
-      }
-    );
-
-    if (!response.data) {
-      console.log("Duplicate or active message ignored:", messageId);
-      inFlightMessages.delete(messageId);
-      return false;
-    }
-
-    return true;
-  } catch (error) {
-    console.error("SUPABASE MESSAGE CLAIM ERROR:", error.response?.data || error.message);
-    return true;
+  if (!data) {
+    inFlightMessages.delete(messageId);
+    console.log("Duplicate or active message ignored:", messageId);
+    return false;
   }
+
+  return true;
 }
 
 async function markInboundMessageProcessed(messageId) {
@@ -167,28 +123,14 @@ async function markInboundMessageProcessed(messageId) {
   }
 
   inFlightMessages.delete(messageId);
-  processedMessages.add(messageId);
+  rememberProcessedMessage(messageId);
 
-  setTimeout(() => {
-    processedMessages.delete(messageId);
-  }, 60000);
+  const { error } = await supabase.rpc("complete_inbound_message", {
+    p_message_id: messageId
+  });
 
-  if (!supabaseEnabled) {
-    return;
-  }
-
-  try {
-    await axios.post(
-      `${supabaseRestUrl}/rpc/complete_inbound_message`,
-      {
-        p_message_id: messageId
-      },
-      {
-        headers: supabaseHeaders()
-      }
-    );
-  } catch (error) {
-    console.error("SUPABASE MESSAGE COMPLETE ERROR:", error.response?.data || error.message);
+  if (error) {
+    console.error("SUPABASE MESSAGE COMPLETE ERROR:", error.message);
   }
 }
 
@@ -200,51 +142,16 @@ async function markInboundMessageFailed(messageId, error) {
   inFlightMessages.delete(messageId);
   processedMessages.delete(messageId);
 
-  if (!supabaseEnabled) {
-    return;
-  }
+  const { error: failError } = await supabase.rpc("fail_inbound_message", {
+    p_message_id: messageId,
+    p_last_error: String(error?.message || error).slice(0, 1000)
+  });
 
-  try {
-    await axios.post(
-      `${supabaseRestUrl}/rpc/fail_inbound_message`,
-      {
-        p_message_id: messageId,
-        p_last_error: String(error.response?.data?.message || error.message || error).slice(0, 1000)
-      },
-      {
-        headers: supabaseHeaders()
-      }
-    );
-  } catch (supabaseError) {
-    console.error("SUPABASE MESSAGE FAIL ERROR:", supabaseError.response?.data || supabaseError.message);
+  if (failError) {
+    console.error("SUPABASE MESSAGE FAIL ERROR:", failError.message);
   }
 }
 
-async function createVetCase(userId, user) {
-  if (!supabaseEnabled) {
-    return;
-  }
-
-  try {
-    await axios.post(
-      `${supabaseRestUrl}/vet_cases`,
-      {
-        user_id: userId,
-        pet_type: user.petType || null,
-        problem: user.problem || null,
-        duration: user.duration || null,
-        temperature: user.temperature || null,
-        payment_confirmed: Boolean(user.paid),
-        status: "sent_to_vet"
-      },
-      {
-        headers: supabaseHeaders()
-      }
-    );
-  } catch (error) {
-    console.error("SUPABASE CASE ERROR:", error.response?.data || error.message);
-  }
-}
 
 // ======================================================
 // SUPABASE PERSISTENCE HELPERS
@@ -279,22 +186,6 @@ async function recordMessage({ whatsappMessageId, conversationId, userId, direct
   });
 
   return data;
-}
-
-async function markMessageProcessed(messageId) {
-  const { error } = await supabase
-    .from("processed_messages")
-    .insert({ whatsapp_message_id: messageId });
-
-  if (error?.code === "23505") {
-    return false;
-  }
-
-  if (error) {
-    throw error;
-  }
-
-  return true;
 }
 
 async function getConversation(userId) {
@@ -472,8 +363,26 @@ async function persistPaymentScreenshot({ conversationId, userId, whatsappMessag
 // SEND CASE TO VET
 // ======================================================
 
-async function sendCaseToVet(userId, user) {
+async function createVetCase(userId, user) {
+  const { error } = await supabase
+    .from("vet_cases")
+    .insert({
+      conversation_id: user.id || null,
+      whatsapp_user_id: userId,
+      pet_type: user.pet_type || null,
+      problem: user.problem || null,
+      duration: user.duration || null,
+      temperature: user.temperature || null,
+      payment_confirmed: Boolean(user.paid),
+      status: "sent_to_vet"
+    });
 
+  if (error) {
+    console.error("SUPABASE CASE ERROR:", error.message);
+  }
+}
+
+async function sendCaseToVet(userId, user) {
   await createVetCase(userId, user);
 
   const summary =
@@ -524,18 +433,11 @@ function isEmergency(text) {
 // MAIN BOT LOGIC
 // ======================================================
 
-async function handleMessage(userId, message, type) {
-
-  let user = await getUser(userId);
-
-  // ==========================================
-  // NEW USER
-  // ==========================================
+async function handleMessage(userId, message, type, rawMessage) {
+  let user = await getConversation(userId);
 
   if (!user) {
     user = await createConversation(userId);
-
-    await saveUser(userId, users[userId]);
 
     await sendMessage(
       userId,
@@ -681,8 +583,6 @@ async function handleMessage(userId, message, type) {
         { conversationId: user.id }
       );
   }
-
-  await saveUser(userId, user);
 }
 
 // ======================================================
@@ -706,7 +606,6 @@ module.exports = async (req, res) => {
   }
 
   if (req.method === "POST") {
-
     let message;
     let messageClaimed = false;
 
@@ -723,17 +622,9 @@ module.exports = async (req, res) => {
 
       message = value.messages[0];
 
-      // ======================================
-      // IGNORE OWN
-      // ======================================
-
       if (message.from_me) {
         return res.sendStatus(200);
       }
-
-      // ======================================
-      // DEDUPLICATION / PROCESSING CLAIM
-      // ======================================
 
       messageClaimed = await beginInboundMessageProcessing(message);
 
@@ -741,6 +632,7 @@ module.exports = async (req, res) => {
         return res.sendStatus(200);
       }
 
+      const messageId = message.id;
       const from = message.from;
       const type = message.type;
       let text = "";
@@ -754,8 +646,7 @@ module.exports = async (req, res) => {
       console.log("TYPE:", type);
       console.log("TEXT:", text);
 
-      await handleMessage(from, text, type);
-      await markInboundMessageProcessed(message.id);
+      const conversation = await getConversation(from);
 
       await recordMessage({
         whatsappMessageId: messageId,
@@ -769,7 +660,10 @@ module.exports = async (req, res) => {
       });
 
       await handleMessage(from, text, type, message);
+      await markInboundMessageProcessed(messageId);
 
+      return res.sendStatus(200);
+    } catch (error) {
       if (messageClaimed) {
         await markInboundMessageFailed(message?.id, error);
       }
@@ -789,3 +683,6 @@ module.exports = async (req, res) => {
 
   return res.sendStatus(405);
 };
+
+module.exports.requireSupabaseUser = requireSupabaseUser;
+module.exports.getSupabaseUserClient = getSupabaseUserClient;

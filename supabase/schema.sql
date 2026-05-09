@@ -4,20 +4,49 @@
 
 create extension if not exists pgcrypto;
 
-create table if not exists public.conversations (
-  user_id text primary key,
-  state text not null default 'ASK_PET',
-  pet_type text,
-  problem text,
-  duration text,
-  temperature text,
-  paid boolean not null default false,
-  last_message_at timestamptz,
+-- Dashboard users are Supabase Auth users. A profile links a dashboard user to a
+-- WhatsApp number and/or elevated dashboard role.
+create table if not exists public.app_profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  email text,
+  display_name text,
+  phone_number text unique,
+  role text not null default 'customer' check (role in ('customer', 'vet', 'admin')),
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  constraint conversations_state_check check (
-    state in ('ASK_PET', 'ASK_PROBLEM', 'ASK_DURATION', 'ASK_TEMP', 'WAIT_PAYMENT', 'DOCTOR', 'END')
-  )
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.bot_conversations (
+  id uuid primary key default gen_random_uuid(),
+  whatsapp_user_id text not null unique,
+  state text not null default 'ASK_PET',
+  pet_type text not null default '',
+  problem text not null default '',
+  duration text not null default '',
+  temperature text not null default '',
+  paid boolean not null default false,
+  payment_screenshot_url text,
+  assigned_vet_id uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.messages (
+  id uuid primary key default gen_random_uuid(),
+  whatsapp_message_id text unique,
+  conversation_id uuid references public.bot_conversations(id) on delete set null,
+  whatsapp_user_id text not null,
+  direction text not null check (direction in ('inbound', 'outbound')),
+  message_type text not null default 'text',
+  body text not null default '',
+  media_url text,
+  raw_payload jsonb,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.processed_messages (
+  whatsapp_message_id text primary key,
+  created_at timestamptz not null default now()
 );
 
 create table if not exists public.inbound_messages (
@@ -27,57 +56,50 @@ create table if not exists public.inbound_messages (
   message_type text not null,
   message_text text,
   payload jsonb not null default '{}'::jsonb,
-  processing_status text not null default 'processing',
+  processing_status text not null default 'processing' check (processing_status in ('processing', 'processed', 'failed')),
   attempt_count integer not null default 0,
   processed_at timestamptz,
   failed_at timestamptz,
   last_error text,
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  constraint inbound_messages_processing_status_check check (
-    processing_status in ('processing', 'processed', 'failed')
-  )
+  updated_at timestamptz not null default now()
 );
-
-alter table public.inbound_messages
-  add column if not exists processing_status text not null default 'processed',
-  add column if not exists attempt_count integer not null default 1,
-  add column if not exists processed_at timestamptz,
-  add column if not exists failed_at timestamptz,
-  add column if not exists last_error text,
-  add column if not exists updated_at timestamptz not null default now();
-
-alter table public.inbound_messages
-  drop constraint if exists inbound_messages_processing_status_check,
-  add constraint inbound_messages_processing_status_check check (
-    processing_status in ('processing', 'processed', 'failed')
-  );
 
 create table if not exists public.vet_cases (
   id uuid primary key default gen_random_uuid(),
-  user_id text not null references public.conversations(user_id) on delete cascade,
+  conversation_id uuid references public.bot_conversations(id) on delete set null,
+  whatsapp_user_id text not null,
   pet_type text,
   problem text,
   duration text,
   temperature text,
   payment_confirmed boolean not null default false,
-  status text not null default 'sent_to_vet',
+  status text not null default 'sent_to_vet' check (status in ('sent_to_vet', 'in_review', 'replied', 'closed')),
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  constraint vet_cases_status_check check (
-    status in ('sent_to_vet', 'in_review', 'replied', 'closed')
-  )
+  updated_at timestamptz not null default now()
 );
 
-create index if not exists inbound_messages_user_id_created_at_idx
-  on public.inbound_messages (user_id, created_at desc);
+create table if not exists public.uploaded_images (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid references public.bot_conversations(id) on delete cascade,
+  whatsapp_user_id text not null,
+  whatsapp_message_id text,
+  storage_bucket text not null default 'payment-screenshots',
+  storage_url text not null,
+  image_type text not null default 'payment_screenshot',
+  raw_payload jsonb,
+  created_at timestamptz not null default now()
+);
 
-create index if not exists conversations_last_message_at_idx
-  on public.conversations (last_message_at desc);
+create index if not exists bot_conversations_state_idx on public.bot_conversations(state);
+create index if not exists messages_conversation_created_idx on public.messages(conversation_id, created_at desc);
+create index if not exists messages_whatsapp_user_created_idx on public.messages(whatsapp_user_id, created_at desc);
+create index if not exists uploaded_images_conversation_idx on public.uploaded_images(conversation_id);
+create index if not exists processed_messages_created_idx on public.processed_messages(created_at);
+create index if not exists inbound_messages_user_created_idx on public.inbound_messages(user_id, created_at desc);
+create index if not exists vet_cases_user_created_idx on public.vet_cases(whatsapp_user_id, created_at desc);
 
-create index if not exists vet_cases_user_id_created_at_idx
-  on public.vet_cases (user_id, created_at desc);
-
+-- Keep updated_at fresh without application-specific triggers.
 create or replace function public.set_updated_at()
 returns trigger
 language plpgsql
@@ -88,23 +110,25 @@ begin
 end;
 $$;
 
-drop trigger if exists set_conversations_updated_at on public.conversations;
-create trigger set_conversations_updated_at
-before update on public.conversations
-for each row
-execute function public.set_updated_at();
+drop trigger if exists app_profiles_set_updated_at on public.app_profiles;
+create trigger app_profiles_set_updated_at
+before update on public.app_profiles
+for each row execute function public.set_updated_at();
 
-drop trigger if exists set_inbound_messages_updated_at on public.inbound_messages;
-create trigger set_inbound_messages_updated_at
+drop trigger if exists bot_conversations_set_updated_at on public.bot_conversations;
+create trigger bot_conversations_set_updated_at
+before update on public.bot_conversations
+for each row execute function public.set_updated_at();
+
+drop trigger if exists inbound_messages_set_updated_at on public.inbound_messages;
+create trigger inbound_messages_set_updated_at
 before update on public.inbound_messages
-for each row
-execute function public.set_updated_at();
+for each row execute function public.set_updated_at();
 
-drop trigger if exists set_vet_cases_updated_at on public.vet_cases;
-create trigger set_vet_cases_updated_at
+drop trigger if exists vet_cases_set_updated_at on public.vet_cases;
+create trigger vet_cases_set_updated_at
 before update on public.vet_cases
-for each row
-execute function public.set_updated_at();
+for each row execute function public.set_updated_at();
 
 create or replace function public.claim_inbound_message(
   p_message_id text,
@@ -204,32 +228,195 @@ begin
 end;
 $$;
 
-alter table public.conversations enable row level security;
+-- Helper predicates for RLS policies.
+create or replace function public.current_user_role()
+returns text
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select role from public.app_profiles where id = auth.uid()
+$$;
+
+create or replace function public.current_user_phone_number()
+returns text
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select phone_number from public.app_profiles where id = auth.uid()
+$$;
+
+create or replace function public.is_dashboard_staff()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select coalesce(public.current_user_role() in ('vet', 'admin'), false)
+$$;
+
+alter table public.app_profiles enable row level security;
+alter table public.bot_conversations enable row level security;
+alter table public.messages enable row level security;
+alter table public.processed_messages enable row level security;
 alter table public.inbound_messages enable row level security;
+alter table public.uploaded_images enable row level security;
 alter table public.vet_cases enable row level security;
 
--- The webhook uses SUPABASE_SERVICE_ROLE_KEY, which bypasses RLS on the server.
--- These policies keep browser clients read-only/locked down unless you add Supabase Auth later.
-drop policy if exists "No public conversation access" on public.conversations;
-create policy "No public conversation access"
-on public.conversations
-for all
-to anon, authenticated
+-- Profiles: users can read/update themselves; admins can manage all dashboard profiles.
+drop policy if exists "profiles_select_own_or_admin" on public.app_profiles;
+create policy "profiles_select_own_or_admin"
+on public.app_profiles for select
+to authenticated
+using (id = auth.uid() or public.current_user_role() = 'admin');
+
+drop policy if exists "profiles_insert_own_customer" on public.app_profiles;
+create policy "profiles_insert_own_customer"
+on public.app_profiles for insert
+to authenticated
+with check (id = auth.uid() and role = 'customer');
+
+drop policy if exists "profiles_update_own_without_role_escalation" on public.app_profiles;
+create policy "profiles_update_own_without_role_escalation"
+on public.app_profiles for update
+to authenticated
+using (id = auth.uid())
+with check (id = auth.uid() and role = public.current_user_role());
+
+drop policy if exists "profiles_update_admin" on public.app_profiles;
+create policy "profiles_update_admin"
+on public.app_profiles for update
+to authenticated
+using (public.current_user_role() = 'admin')
+with check (public.current_user_role() = 'admin');
+
+-- Conversations/messages/images: customers see their linked WhatsApp number; vets/admins see all.
+drop policy if exists "conversations_select_customer_or_staff" on public.bot_conversations;
+create policy "conversations_select_customer_or_staff"
+on public.bot_conversations for select
+to authenticated
+using (whatsapp_user_id = public.current_user_phone_number() or public.is_dashboard_staff());
+
+drop policy if exists "conversations_update_staff" on public.bot_conversations;
+create policy "conversations_update_staff"
+on public.bot_conversations for update
+to authenticated
+using (public.is_dashboard_staff())
+with check (public.is_dashboard_staff());
+
+drop policy if exists "messages_select_customer_or_staff" on public.messages;
+create policy "messages_select_customer_or_staff"
+on public.messages for select
+to authenticated
+using (whatsapp_user_id = public.current_user_phone_number() or public.is_dashboard_staff());
+
+drop policy if exists "messages_insert_staff" on public.messages;
+create policy "messages_insert_staff"
+on public.messages for insert
+to authenticated
+with check (public.is_dashboard_staff());
+
+drop policy if exists "uploaded_images_select_customer_or_staff" on public.uploaded_images;
+create policy "uploaded_images_select_customer_or_staff"
+on public.uploaded_images for select
+to authenticated
+using (whatsapp_user_id = public.current_user_phone_number() or public.is_dashboard_staff());
+
+-- Webhook dedupe state is server-only. The service role bypasses RLS for inserts/selects.
+drop policy if exists "processed_messages_no_client_access" on public.processed_messages;
+create policy "processed_messages_no_client_access"
+on public.processed_messages for all
+to authenticated
 using (false)
 with check (false);
 
-drop policy if exists "No public inbound message access" on public.inbound_messages;
-create policy "No public inbound message access"
-on public.inbound_messages
-for all
-to anon, authenticated
+drop policy if exists "inbound_messages_no_client_access" on public.inbound_messages;
+create policy "inbound_messages_no_client_access"
+on public.inbound_messages for all
+to authenticated
 using (false)
 with check (false);
 
-drop policy if exists "No public vet case access" on public.vet_cases;
-create policy "No public vet case access"
-on public.vet_cases
-for all
-to anon, authenticated
-using (false)
-with check (false);
+drop policy if exists "vet_cases_select_staff" on public.vet_cases;
+create policy "vet_cases_select_staff"
+on public.vet_cases for select
+to authenticated
+using (public.is_dashboard_staff());
+
+drop policy if exists "vet_cases_update_staff" on public.vet_cases;
+create policy "vet_cases_update_staff"
+on public.vet_cases for update
+to authenticated
+using (public.is_dashboard_staff())
+with check (public.is_dashboard_staff());
+
+-- Storage bucket for payment screenshots. The webhook writes with service role; dashboard users
+-- can read screenshots for their conversations through Storage policies.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'payment-screenshots',
+  'payment-screenshots',
+  false,
+  10485760,
+  array['image/jpeg', 'image/png', 'image/webp', 'image/heic']
+)
+on conflict (id) do update set
+  public = excluded.public,
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
+
+alter table storage.objects enable row level security;
+
+drop policy if exists "payment_screenshots_read_customer_or_staff" on storage.objects;
+create policy "payment_screenshots_read_customer_or_staff"
+on storage.objects for select
+to authenticated
+using (
+  bucket_id = 'payment-screenshots'
+  and (
+    public.is_dashboard_staff()
+    or split_part(name, '/', 1) = public.current_user_phone_number()
+  )
+);
+
+drop policy if exists "payment_screenshots_staff_upload" on storage.objects;
+create policy "payment_screenshots_staff_upload"
+on storage.objects for insert
+to authenticated
+with check (bucket_id = 'payment-screenshots' and public.is_dashboard_staff());
+
+-- Supabase Realtime publication for dashboard subscriptions.
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'bot_conversations'
+  ) then
+    alter publication supabase_realtime add table public.bot_conversations;
+  end if;
+
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'messages'
+  ) then
+    alter publication supabase_realtime add table public.messages;
+  end if;
+
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'uploaded_images'
+  ) then
+    alter publication supabase_realtime add table public.uploaded_images;
+  end if;
+
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'vet_cases'
+  ) then
+    alter publication supabase_realtime add table public.vet_cases;
+  end if;
+end $$;
