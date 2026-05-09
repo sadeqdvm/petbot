@@ -7,15 +7,175 @@ const axios = require("axios");
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const VET_NUMBER = "8801721417598";
 
 // ======================================================
-// TEMP MEMORY
+// TEMP MEMORY FALLBACK
 // ======================================================
 
 const users = {};
 const processedMessages = new Set();
+
+// ======================================================
+// SUPABASE REST HELPERS
+// ======================================================
+
+const supabaseEnabled = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+const supabaseRestUrl = supabaseEnabled
+  ? `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1`
+  : "";
+
+function supabaseHeaders(extraHeaders = {}) {
+  return {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    ...extraHeaders
+  };
+}
+
+function dbConversationToUser(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    state: row.state,
+    petType: row.pet_type || "",
+    problem: row.problem || "",
+    duration: row.duration || "",
+    temperature: row.temperature || "",
+    paid: Boolean(row.paid)
+  };
+}
+
+function userToDbConversation(userId, user) {
+  return {
+    user_id: userId,
+    state: user.state,
+    pet_type: user.petType || null,
+    problem: user.problem || null,
+    duration: user.duration || null,
+    temperature: user.temperature || null,
+    paid: Boolean(user.paid),
+    last_message_at: new Date().toISOString()
+  };
+}
+
+async function getUser(userId) {
+  if (!supabaseEnabled) {
+    return users[userId] || null;
+  }
+
+  try {
+    const response = await axios.get(
+      `${supabaseRestUrl}/conversations?user_id=eq.${encodeURIComponent(userId)}&select=*`,
+      {
+        headers: supabaseHeaders()
+      }
+    );
+
+    return dbConversationToUser(response.data?.[0]);
+  } catch (error) {
+    console.error("SUPABASE GET USER ERROR:", error.response?.data || error.message);
+    return users[userId] || null;
+  }
+}
+
+async function saveUser(userId, user) {
+  users[userId] = user;
+
+  if (!supabaseEnabled) {
+    return;
+  }
+
+  try {
+    await axios.post(
+      `${supabaseRestUrl}/conversations?on_conflict=user_id`,
+      userToDbConversation(userId, user),
+      {
+        headers: supabaseHeaders({
+          Prefer: "resolution=merge-duplicates"
+        })
+      }
+    );
+  } catch (error) {
+    console.error("SUPABASE SAVE USER ERROR:", error.response?.data || error.message);
+  }
+}
+
+async function recordInboundMessage(message) {
+  const messageId = message.id;
+
+  if (processedMessages.has(messageId)) {
+    return false;
+  }
+
+  processedMessages.add(messageId);
+
+  setTimeout(() => {
+    processedMessages.delete(messageId);
+  }, 60000);
+
+  if (!supabaseEnabled) {
+    return true;
+  }
+
+  try {
+    await axios.post(
+      `${supabaseRestUrl}/inbound_messages`,
+      {
+        message_id: messageId,
+        user_id: message.from,
+        message_type: message.type,
+        message_text: message.text?.body || null,
+        payload: message
+      },
+      {
+        headers: supabaseHeaders()
+      }
+    );
+
+    return true;
+  } catch (error) {
+    if (error.response?.status === 409) {
+      console.log("Duplicate ignored:", messageId);
+      return false;
+    }
+
+    console.error("SUPABASE MESSAGE LOG ERROR:", error.response?.data || error.message);
+    return true;
+  }
+}
+
+async function createVetCase(userId, user) {
+  if (!supabaseEnabled) {
+    return;
+  }
+
+  try {
+    await axios.post(
+      `${supabaseRestUrl}/vet_cases`,
+      {
+        user_id: userId,
+        pet_type: user.petType || null,
+        problem: user.problem || null,
+        duration: user.duration || null,
+        temperature: user.temperature || null,
+        payment_confirmed: Boolean(user.paid),
+        status: "sent_to_vet"
+      },
+      {
+        headers: supabaseHeaders()
+      }
+    );
+  } catch (error) {
+    console.error("SUPABASE CASE ERROR:", error.response?.data || error.message);
+  }
+}
 
 // ======================================================
 // SEND MESSAGE
@@ -58,6 +218,8 @@ async function sendMessage(to, text) {
 // ======================================================
 
 async function sendCaseToVet(userId, user) {
+
+  await createVetCase(userId, user);
 
   const summary =
 `🐾 নতুন কনসাল্টেশন
@@ -110,7 +272,7 @@ function isEmergency(text) {
 
 async function handleMessage(userId, message, type) {
 
-  let user = users[userId];
+  let user = await getUser(userId);
 
   // ==========================================
   // NEW USER
@@ -126,6 +288,8 @@ async function handleMessage(userId, message, type) {
       temperature: "",
       paid: false
     };
+
+    await saveUser(userId, users[userId]);
 
     await sendMessage(
       userId,
@@ -294,7 +458,7 @@ async function handleMessage(userId, message, type) {
       );
   }
 
-  users[userId] = user;
+  await saveUser(userId, user);
 }
 
 // ======================================================
@@ -347,20 +511,11 @@ module.exports = async (req, res) => {
       // DEDUPLICATION
       // ======================================
 
-      const messageId = message.id;
+      const messageRecorded = await recordInboundMessage(message);
 
-      if (processedMessages.has(messageId)) {
-
-        console.log("Duplicate ignored:", messageId);
-
+      if (!messageRecorded) {
         return res.sendStatus(200);
       }
-
-      processedMessages.add(messageId);
-
-      setTimeout(() => {
-        processedMessages.delete(messageId);
-      }, 60000);
 
       // ======================================
       // IGNORE OWN
