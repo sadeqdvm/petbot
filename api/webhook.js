@@ -1,4 +1,11 @@
+require("dotenv").config();
+
+const express = require("express");
 const axios = require("axios");
+
+const app = express();
+
+app.use(express.json());
 
 // ======================================================
 // ENV VARIABLES
@@ -8,49 +15,188 @@ const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
+// Vet number (with country code)
+const VET_NUMBER = "8801721417598";
+
 // ======================================================
 // TEMP STORAGE
 // ======================================================
 
 const users = {};
-
-// Prevent duplicate webhook processing
 const processedMessages = new Set();
 
 // ======================================================
-// SEND MESSAGE
+// WEBHOOK VERIFICATION
+// ======================================================
+
+app.get("/", (req, res) => {
+
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  console.log("Verification request received");
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+
+    console.log("Webhook verified");
+
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+});
+
+// ======================================================
+// RECEIVE WEBHOOK EVENTS
+// ======================================================
+
+app.post("/", async (req, res) => {
+
+  try {
+
+    console.log(
+      "FULL WEBHOOK:",
+      JSON.stringify(req.body, null, 2)
+    );
+
+    const body = req.body;
+
+    const message =
+      body?.entry?.[0]
+        ?.changes?.[0]
+        ?.value?.messages?.[0];
+
+    // Ignore non-message events
+    if (!message) {
+      return res.sendStatus(200);
+    }
+
+    // ==================================================
+    // DUPLICATE PROTECTION
+    // ==================================================
+
+    const messageId = message.id;
+
+    if (processedMessages.has(messageId)) {
+
+      console.log("Duplicate message ignored");
+
+      return res.sendStatus(200);
+    }
+
+    processedMessages.add(messageId);
+
+    setTimeout(() => {
+      processedMessages.delete(messageId);
+    }, 5 * 60 * 1000);
+
+    // ==================================================
+    // EXTRACT MESSAGE
+    // ==================================================
+
+    const from = message.from;
+    const type = message.type;
+
+    let text = "";
+
+    if (type === "text") {
+      text = message.text?.body?.trim() || "";
+    }
+
+    console.log("================================");
+    console.log("FROM:", from);
+    console.log("TYPE:", type);
+    console.log("TEXT:", text);
+    console.log("================================");
+
+    await handleMessage(from, text, type);
+
+    return res.sendStatus(200);
+
+  } catch (error) {
+
+    console.error(
+      "WEBHOOK ERROR:",
+      error.response?.data ||
+      error.message ||
+      error
+    );
+
+    return res.sendStatus(200);
+  }
+});
+
+// ======================================================
+// SEND WHATSAPP MESSAGE
 // ======================================================
 
 async function sendMessage(to, text) {
 
   try {
 
-    await axios.post(
-      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
-      {
+    console.log("Sending message to:", to);
+
+    const response = await axios({
+      method: "POST",
+      url: `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`,
+      headers: {
+        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      data: {
         messaging_product: "whatsapp",
+        recipient_type: "individual",
         to: to,
+        type: "text",
         text: {
+          preview_url: false,
           body: text
         }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${ACCESS_TOKEN}`,
-          "Content-Type": "application/json"
-        }
       }
-    );
+    });
 
-    console.log("Message sent:", to);
+    console.log("Message sent:", response.data);
 
   } catch (error) {
 
     console.error(
       "SEND ERROR:",
-      error.response?.data || error.message
+      error.response?.data ||
+      error.message ||
+      error
     );
   }
+}
+
+// ======================================================
+// SEND CASE SUMMARY TO VET
+// ======================================================
+
+async function sendCaseToVet(userId, user) {
+
+  const summary =
+`🐾 নতুন কনসাল্টেশন
+
+👤 User:
+${userId}
+
+🐶 Pet:
+${user.petType}
+
+🩺 Problem:
+${user.problem}
+
+⏳ Duration:
+${user.duration}
+
+🌡️ Temperature:
+${user.temperature}
+
+💰 Payment:
+Confirmed`;
+
+  await sendMessage(VET_NUMBER, summary);
 }
 
 // ======================================================
@@ -66,8 +212,8 @@ function isEmergency(text) {
     "collapsed",
     "unconscious",
     "রক্ত",
-    "খিঁচুনি",
     "শ্বাস নিচ্ছে না",
+    "খিঁচুনি",
     "অজ্ঞান"
   ];
 
@@ -89,12 +235,11 @@ async function handleMessage(userId, message, type) {
     petType: "",
     problem: "",
     duration: "",
-    temperature: ""
+    temperature: "",
+    paid: false
   };
 
-  console.log("USER:", userId);
-  console.log("STATE:", user.state);
-  console.log("MESSAGE:", message);
+  console.log("CURRENT STATE:", user.state);
 
   switch (user.state) {
 
@@ -106,7 +251,7 @@ async function handleMessage(userId, message, type) {
 
       await sendMessage(
         userId,
-        "আসসালামু আলাইকুম 🐾\n\nআপনার পোষা প্রাণী কী?\n\n১. বিড়াল\n২. কুকুর\n৩. পাখি\n৪. অন্যান্য"
+        "আসসালামু আলাইকুম 🐶🐱\n\nআপনার পোষা প্রাণীটি কী?\n\n১. বিড়াল\n২. কুকুর\n৩. পাখি\n৪. অন্যান্য"
       );
 
       user.state = "ASK_PET";
@@ -114,7 +259,7 @@ async function handleMessage(userId, message, type) {
       break;
 
     // ==================================================
-    // ASK PET
+    // ASK PET TYPE
     // ==================================================
 
     case "ASK_PET":
@@ -124,33 +269,32 @@ async function handleMessage(userId, message, type) {
         message === "1" ||
         message.includes("বিড়াল")
       ) {
-
         user.petType = "Cat";
+      }
 
-      } else if (
+      else if (
         message === "২" ||
         message === "2" ||
         message.includes("কুকুর")
       ) {
-
         user.petType = "Dog";
+      }
 
-      } else if (
+      else if (
         message === "৩" ||
         message === "3" ||
         message.includes("পাখি")
       ) {
-
         user.petType = "Bird";
+      }
 
-      } else {
-
+      else {
         user.petType = "Other";
       }
 
       await sendMessage(
         userId,
-        "🩺 কী সমস্যা হচ্ছে?"
+        "🩺 আপনার পোষা প্রাণীর কী সমস্যা হচ্ছে?"
       );
 
       user.state = "ASK_PROBLEM";
@@ -169,7 +313,7 @@ async function handleMessage(userId, message, type) {
 
         await sendMessage(
           userId,
-          "⚠️ এটি জরুরি সমস্যা হতে পারে। দ্রুত নিকটস্থ ভেট ক্লিনিকে যোগাযোগ করুন।"
+          "⚠️ এটি জরুরি সমস্যা হতে পারে।\n\nদ্রুত নিকটস্থ ভেট ক্লিনিকে যোগাযোগ করুন।"
         );
 
         user.state = "END";
@@ -196,10 +340,10 @@ async function handleMessage(userId, message, type) {
 
       await sendMessage(
         userId,
-        "🌡️ শরীরের তাপমাত্রা জানা থাকলে লিখুন। না জানলে লিখুন: জানি না"
+        "🌡️ শরীরের তাপমাত্রা জানা থাকলে লিখুন।\n\nনা জানলে লিখুন: জানি না"
       );
 
-      user.state = "ASK_TEMPERATURE";
+      user.state = "ASK_TEMP";
 
       break;
 
@@ -207,13 +351,13 @@ async function handleMessage(userId, message, type) {
     // ASK TEMPERATURE
     // ==================================================
 
-    case "ASK_TEMPERATURE":
+    case "ASK_TEMP":
 
       user.temperature = message;
 
       await sendMessage(
         userId,
-        "💰 অনলাইন কনসাল্টেশন ফি: ১০০ টাকা\n\n📱 বিকাশ: 01721417598\n\nপেমেন্ট করে স্ক্রিনশট পাঠান।"
+        "🩺 অনলাইন ভেট কনসাল্টেশন ফি: ১০০ টাকা\n\n📱 বিকাশ: 01721417598\n\nপেমেন্ট করে স্ক্রিনশট পাঠান 📸"
       );
 
       user.state = "WAIT_PAYMENT";
@@ -228,9 +372,14 @@ async function handleMessage(userId, message, type) {
 
       if (type === "image") {
 
+        user.paid = true;
+
+        // Send case to vet
+        await sendCaseToVet(userId, user);
+
         await sendMessage(
           userId,
-          "✅ পেমেন্ট গ্রহণ করা হয়েছে।\n\n⏱️ ৫-১০ মিনিটের মধ্যে ডাক্তার রিপ্লাই করবেন।"
+          "✅ পেমেন্ট গ্রহণ করা হয়েছে।\n\n⏱️ সাধারণত ৫-১০ মিনিটের মধ্যে ডাক্তার রিপ্লাই করবেন।"
         );
 
         user.state = "DOCTOR";
@@ -246,7 +395,7 @@ async function handleMessage(userId, message, type) {
       break;
 
     // ==================================================
-    // DOCTOR MODE
+    // DOCTOR TAKEOVER
     // ==================================================
 
     case "DOCTOR":
@@ -278,10 +427,11 @@ async function handleMessage(userId, message, type) {
 
       await sendMessage(
         userId,
-        "সিস্টেম রিস্টার্ট হয়েছে। আবার লিখুন।"
+        "আবার মেসেজ দিন।"
       );
   }
 
+  // Save updated state
   users[userId] = user;
 
   console.log("UPDATED USER:");
@@ -289,144 +439,7 @@ async function handleMessage(userId, message, type) {
 }
 
 // ======================================================
-// MAIN WEBHOOK FUNCTION
+// EXPORT FOR VERCEL
 // ======================================================
 
-module.exports = async (req, res) => {
-
-  // ====================================================
-  // WEBHOOK VERIFICATION
-  // ====================================================
-
-  if (req.method === "GET") {
-
-    const mode = req.query["hub.mode"];
-    const token = req.query["hub.verify_token"];
-    const challenge = req.query["hub.challenge"];
-
-    console.log("Verification request received");
-
-    if (
-      mode === "subscribe" &&
-      token === VERIFY_TOKEN
-    ) {
-
-      console.log("Webhook verified");
-
-      return res.status(200).send(challenge);
-    }
-
-    return res.status(403).send("Forbidden");
-  }
-
-  // ====================================================
-  // RECEIVE EVENTS
-  // ====================================================
-
-  if (req.method === "POST") {
-
-    try {
-
-      console.log(
-        JSON.stringify(req.body, null, 2)
-      );
-
-      const value =
-        req.body.entry?.[0]?.changes?.[0]?.value;
-
-      // Ignore status updates
-      if (value?.statuses) {
-
-        return res.status(200).send("OK");
-      }
-
-      const message =
-        value?.messages?.[0];
-
-      // Ignore empty
-      if (!message) {
-
-        return res.status(200).send("OK");
-      }
-
-      // ==================================================
-      // PREVENT DUPLICATES
-      // ==================================================
-
-      const messageId = message.id;
-
-      if (processedMessages.has(messageId)) {
-
-        console.log("Duplicate ignored");
-
-        return res.status(200).send("OK");
-      }
-
-      processedMessages.add(messageId);
-
-      // Auto cleanup after 5 minutes
-      setTimeout(() => {
-        processedMessages.delete(messageId);
-      }, 5 * 60 * 1000);
-
-      // ==================================================
-      // MESSAGE DATA
-      // ==================================================
-
-      const from = message.from;
-      const type = message.type;
-
-      let text = "";
-
-      if (type === "text") {
-
-        text = message.text?.body || "";
-
-      } else if (type === "image") {
-
-        text = "image";
-
-      } else {
-
-        return res.status(200).send("OK");
-      }
-
-      console.log("FROM:", from);
-      console.log("TYPE:", type);
-      console.log("TEXT:", text);
-
-      // VERY IMPORTANT:
-      // respond FAST before processing
-
-      res.status(200).send("OK");
-
-      // Process bot
-      await handleMessage(
-        from,
-        text,
-        type
-      );
-
-      return;
-
-    } catch (error) {
-
-      console.error(
-        "WEBHOOK ERROR:",
-        error.response?.data || error.message
-      );
-
-      return res
-        .status(500)
-        .send("Server Error");
-    }
-  }
-
-  // ====================================================
-  // INVALID METHOD
-  // ====================================================
-
-  return res
-    .status(405)
-    .send("Method Not Allowed");
-};
+module.exports = app;
