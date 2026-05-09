@@ -11,239 +11,130 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const supabase = createClient(SUPABASE_URL || "http://localhost:54321", SUPABASE_SERVICE_ROLE_KEY || "missing", {
-  auth: {
-    autoRefreshToken: false,
-    persistSession: false
-  }
-});
+const VET_NUMBER = "8801721417598";
+const PROCESSED_MESSAGE_TTL_MS = 15 * 60 * 1000;
+const STALE_MESSAGE_MAX_AGE_MS = 5 * 60 * 1000;
+const DUPLICATE_FINGERPRINT_TTL_MS = 2 * 60 * 1000;
+const MAX_PROCESSED_MESSAGES = 1000;
 
 // ======================================================
 // TEMP MEMORY FALLBACK
 // ======================================================
 
 const users = {};
-const processedMessages = new Set();
-const inFlightMessages = new Set();
-const INBOUND_PROCESSING_STALE_SECONDS = Number(process.env.INBOUND_PROCESSING_STALE_SECONDS || 300);
+const processedMessages = new Map();
 
 // ======================================================
-// SUPABASE REST HELPERS
+// MESSAGE SAFETY HELPERS
 // ======================================================
 
-const supabaseEnabled = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
-const supabaseRestUrl = supabaseEnabled
-  ? `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1`
-  : "";
+function pruneProcessedMessages(now = Date.now()) {
 
-function supabaseHeaders(extraHeaders = {}) {
-  return {
-    apikey: SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-    ...extraHeaders
-  };
-}
+  for (const [messageId, expiresAt] of processedMessages) {
 
-function dbConversationToUser(row) {
-  if (!row) {
-    return null;
-  }
-
-  return {
-    state: row.state,
-    petType: row.pet_type || "",
-    problem: row.problem || "",
-    duration: row.duration || "",
-    temperature: row.temperature || "",
-    paid: Boolean(row.paid)
-  };
-}
-
-function userToDbConversation(userId, user) {
-  return {
-    user_id: userId,
-    state: user.state,
-    pet_type: user.petType || null,
-    problem: user.problem || null,
-    duration: user.duration || null,
-    temperature: user.temperature || null,
-    paid: Boolean(user.paid),
-    last_message_at: new Date().toISOString()
-  };
-}
-
-async function getUser(userId) {
-  if (!supabaseEnabled) {
-    return users[userId] || null;
-  }
-
-  try {
-    const response = await axios.get(
-      `${supabaseRestUrl}/conversations?user_id=eq.${encodeURIComponent(userId)}&select=*`,
-      {
-        headers: supabaseHeaders()
-      }
-    );
-
-    return dbConversationToUser(response.data?.[0]);
-  } catch (error) {
-    console.error("SUPABASE GET USER ERROR:", error.response?.data || error.message);
-    return users[userId] || null;
+    if (expiresAt <= now || processedMessages.size > MAX_PROCESSED_MESSAGES) {
+      processedMessages.delete(messageId);
+    }
   }
 }
 
-async function saveUser(userId, user) {
-  users[userId] = user;
-
-  if (!supabaseEnabled) {
-    return;
-  }
-
-  try {
-    await axios.post(
-      `${supabaseRestUrl}/conversations?on_conflict=user_id`,
-      userToDbConversation(userId, user),
-      {
-        headers: supabaseHeaders({
-          Prefer: "resolution=merge-duplicates"
-        })
-      }
-    );
-  } catch (error) {
-    console.error("SUPABASE SAVE USER ERROR:", error.response?.data || error.message);
-  }
-}
-
-async function beginInboundMessageProcessing(message) {
-  const messageId = message.id;
+function hasRecentlyProcessedMessage(messageId, now = Date.now()) {
 
   if (!messageId) {
-    return true;
-  }
-
-  if (processedMessages.has(messageId) || inFlightMessages.has(messageId)) {
     return false;
   }
 
-  inFlightMessages.add(messageId);
+  pruneProcessedMessages(now);
 
-  if (!supabaseEnabled) {
+  const expiresAt = processedMessages.get(messageId);
+
+  if (expiresAt && expiresAt > now) {
     return true;
   }
 
-  try {
-    const response = await axios.post(
-      `${supabaseRestUrl}/rpc/claim_inbound_message`,
-      {
-        p_message_id: messageId,
-        p_user_id: message.from,
-        p_message_type: message.type,
-        p_message_text: message.text?.body || null,
-        p_payload: message,
-        p_stale_after_seconds: INBOUND_PROCESSING_STALE_SECONDS
-      },
-      {
-        headers: supabaseHeaders()
-      }
-    );
+  processedMessages.set(messageId, now + PROCESSED_MESSAGE_TTL_MS);
 
-    if (!response.data) {
-      console.log("Duplicate or active message ignored:", messageId);
-      inFlightMessages.delete(messageId);
-      return false;
-    }
+  return false;
+}
 
+function isStaleMessage(message, now = Date.now()) {
+
+  const timestampSeconds = Number(message?.timestamp);
+
+  if (!Number.isFinite(timestampSeconds)) {
+    return false;
+  }
+
+  return now - (timestampSeconds * 1000) > STALE_MESSAGE_MAX_AGE_MS;
+}
+
+function buildMessageFingerprint(message, text) {
+
+  return [
+    message.from || "",
+    message.type || "",
+    text || "",
+    message.image?.id || "",
+    message.document?.id || ""
+  ].join(":");
+}
+
+function isDuplicateUserInput(user, fingerprint, now = Date.now()) {
+
+  if (!fingerprint) {
+    return false;
+  }
+
+  if (
+    user.lastInboundFingerprint === fingerprint &&
+    user.lastInboundAt &&
+    now - user.lastInboundAt < DUPLICATE_FINGERPRINT_TTL_MS
+  ) {
     return true;
-  } catch (error) {
-    console.error("SUPABASE MESSAGE CLAIM ERROR:", error.response?.data || error.message);
-    return true;
   }
+
+  user.lastInboundFingerprint = fingerprint;
+  user.lastInboundAt = now;
+
+  return false;
 }
 
-async function markInboundMessageProcessed(messageId) {
-  if (!messageId) {
-    return;
-  }
 
-  inFlightMessages.delete(messageId);
-  processedMessages.add(messageId);
+function isPetAnswer(text) {
 
-  setTimeout(() => {
-    processedMessages.delete(messageId);
-  }, 60000);
+  const value = (text || "").trim().toLowerCase();
+  const petAnswers = [
+    "1",
+    "2",
+    "3",
+    "4",
+    "বিড়াল",
+    "বিড়াল",
+    "কুকুর",
+    "পাখি",
+    "অন্যান্য",
+    "cat",
+    "dog",
+    "bird",
+    "other"
+  ];
 
-  if (!supabaseEnabled) {
-    return;
-  }
-
-  try {
-    await axios.post(
-      `${supabaseRestUrl}/rpc/complete_inbound_message`,
-      {
-        p_message_id: messageId
-      },
-      {
-        headers: supabaseHeaders()
-      }
-    );
-  } catch (error) {
-    console.error("SUPABASE MESSAGE COMPLETE ERROR:", error.response?.data || error.message);
-  }
+  return petAnswers.includes(value);
 }
 
-async function markInboundMessageFailed(messageId, error) {
-  if (!messageId) {
-    return;
-  }
+function createUser() {
 
-  inFlightMessages.delete(messageId);
-  processedMessages.delete(messageId);
-
-  if (!supabaseEnabled) {
-    return;
-  }
-
-  try {
-    await axios.post(
-      `${supabaseRestUrl}/rpc/fail_inbound_message`,
-      {
-        p_message_id: messageId,
-        p_last_error: String(error.response?.data?.message || error.message || error).slice(0, 1000)
-      },
-      {
-        headers: supabaseHeaders()
-      }
-    );
-  } catch (supabaseError) {
-    console.error("SUPABASE MESSAGE FAIL ERROR:", supabaseError.response?.data || supabaseError.message);
-  }
-}
-
-async function createVetCase(userId, user) {
-  if (!supabaseEnabled) {
-    return;
-  }
-
-  try {
-    await axios.post(
-      `${supabaseRestUrl}/vet_cases`,
-      {
-        user_id: userId,
-        pet_type: user.petType || null,
-        problem: user.problem || null,
-        duration: user.duration || null,
-        temperature: user.temperature || null,
-        payment_confirmed: Boolean(user.paid),
-        status: "sent_to_vet"
-      },
-      {
-        headers: supabaseHeaders()
-      }
-    );
-  } catch (error) {
-    console.error("SUPABASE CASE ERROR:", error.response?.data || error.message);
-  }
+  return {
+    state: "ASK_PET",
+    petType: "",
+    problem: "",
+    duration: "",
+    temperature: "",
+    paid: false,
+    paymentMessageId: "",
+    lastInboundFingerprint: "",
+    lastInboundAt: 0
+  };
 }
 
 // ======================================================
@@ -524,24 +415,24 @@ function isEmergency(text) {
 // MAIN BOT LOGIC
 // ======================================================
 
-async function handleMessage(userId, message, type) {
+async function handleMessage(userId, message, type, messageId) {
 
-  let user = await getUser(userId);
-
-  // ==========================================
-  // NEW USER
-  // ==========================================
+  let user = users[userId];
+  const isNewUser = !user;
 
   if (!user) {
-    user = await createConversation(userId);
+    user = createUser();
+    users[userId] = user;
+  }
 
-    await saveUser(userId, users[userId]);
+  const fingerprint = buildMessageFingerprint(
+    { from: userId, type },
+    message
+  );
 
-    await sendMessage(
-      userId,
-      "আসসালামু আলাইকুম 🐶🐱\n\nআপনার পোষা প্রাণীটি কী?\n\n১. বিড়াল\n২. কুকুর\n৩. পাখি\n৪. অন্যান্য",
-      { conversationId: user.id }
-    );
+  if (isDuplicateUserInput(user, fingerprint)) {
+
+    console.log("Duplicate user input ignored:", userId, fingerprint);
 
     return;
   }
@@ -553,6 +444,30 @@ async function handleMessage(userId, message, type) {
   console.log("TYPE:", type);
   console.log("================================");
 
+  if (isNewUser && (type !== "text" || !isPetAnswer(message))) {
+
+    await sendMessage(
+      userId,
+      "আসসালামু আলাইকুম 🐶🐱\n\nআপনার পোষা প্রাণীটি কী?\n\n১. বিড়াল\n২. কুকুর\n৩. পাখি\n৪. অন্যান্য"
+    );
+
+    return;
+  }
+
+  if (type !== "text" && !(user.state === "WAIT_PAYMENT" && type === "image")) {
+
+    await sendMessage(
+      userId,
+      "অনুগ্রহ করে টেক্সট মেসেজ পাঠান।"
+    );
+
+    return;
+  }
+
+  // ==========================================
+  // STATES
+  // ==========================================
+
   switch (user.state) {
     case "ASK_PET":
       user = await updateConversation(user.id, {
@@ -562,8 +477,9 @@ async function handleMessage(userId, message, type) {
 
       await sendMessage(
         userId,
-        "🩺 আপনার পোষা প্রাণীর কী সমস্যা হচ্ছে?",
-        { conversationId: user.id }
+        isNewUser
+          ? "আসসালামু আলাইকুম 🐶🐱\n\n🩺 আপনার পোষা প্রাণীর কী সমস্যা হচ্ছে?"
+          : "🩺 আপনার পোষা প্রাণীর কী সমস্যা হচ্ছে?"
       );
 
       break;
@@ -629,13 +545,15 @@ async function handleMessage(userId, message, type) {
       if (type === "image") {
         const mediaUrl = await uploadPaymentScreenshot(userId, rawMessage);
 
-        await persistPaymentScreenshot({
-          conversationId: user.id,
-          userId,
-          whatsappMessageId: rawMessage.id,
-          mediaUrl,
-          rawPayload: rawMessage
-        });
+        if (user.paid) {
+
+          console.log("Payment already confirmed, duplicate image ignored:", userId);
+
+          break;
+        }
+
+        user.paid = true;
+        user.paymentMessageId = messageId || "";
 
         user = await updateConversation(user.id, {
           paid: true,
@@ -665,11 +583,9 @@ async function handleMessage(userId, message, type) {
       break;
 
     case "END":
-      await sendMessage(
-        userId,
-        "ধন্যবাদ ❤️",
-        { conversationId: user.id }
-      );
+
+      console.log("Conversation already ended:", userId);
+
       break;
 
     default:
@@ -713,66 +629,72 @@ module.exports = async (req, res) => {
     try {
       ensureSupabaseConfigured();
 
-      const entry = req.body.entry?.[0];
-      const changes = entry?.changes?.[0];
-      const value = changes?.value;
+      const entries = req.body.entry || [];
 
-      if (!value?.messages) {
-        return res.sendStatus(200);
+      for (const entry of entries) {
+
+        const changes = entry?.changes || [];
+
+        for (const change of changes) {
+
+          const value = change?.value;
+
+          // Ignore statuses and other non-message webhook events.
+          if (!value?.messages) {
+            continue;
+          }
+
+          for (const message of value.messages) {
+
+            // ======================================
+            // DEDUPLICATION
+            // ======================================
+
+            const messageId = message.id;
+
+            if (hasRecentlyProcessedMessage(messageId)) {
+
+              console.log("Duplicate ignored:", messageId);
+
+              continue;
+            }
+
+            if (isStaleMessage(message)) {
+
+              console.log("Stale message ignored:", messageId, message.timestamp);
+
+              continue;
+            }
+
+            // ======================================
+            // IGNORE OWN
+            // ======================================
+
+            if (message.from_me) {
+              continue;
+            }
+
+            const from = message.from;
+            const type = message.type;
+
+            let text = "";
+
+            if (type === "text") {
+              text = message.text?.body?.trim() || "";
+            }
+
+            console.log("FROM:", from);
+            console.log("TYPE:", type);
+            console.log("TEXT:", text);
+
+            await handleMessage(from, text, type, messageId);
+          }
+        }
       }
 
-      message = value.messages[0];
+      return res.sendStatus(200);
 
-      // ======================================
-      // IGNORE OWN
-      // ======================================
-
-      if (message.from_me) {
-        return res.sendStatus(200);
-      }
-
-      // ======================================
-      // DEDUPLICATION / PROCESSING CLAIM
-      // ======================================
-
-      messageClaimed = await beginInboundMessageProcessing(message);
-
-      if (!messageClaimed) {
-        return res.sendStatus(200);
-      }
-
-      const from = message.from;
-      const type = message.type;
-      let text = "";
-      let mediaUrl = null;
-
-      if (type === "text") {
-        text = message.text?.body || "";
-      }
-
-      console.log("FROM:", from);
-      console.log("TYPE:", type);
-      console.log("TEXT:", text);
-
-      await handleMessage(from, text, type);
-      await markInboundMessageProcessed(message.id);
-
-      await recordMessage({
-        whatsappMessageId: messageId,
-        conversationId: conversation?.id || null,
-        userId: from,
-        direction: "inbound",
-        type,
-        body: text,
-        rawPayload: message,
-        mediaUrl
-      });
-
-      await handleMessage(from, text, type, message);
-
-      if (messageClaimed) {
-        await markInboundMessageFailed(message?.id, error);
-      }
+    } catch (error) {
 
       console.error(
         "WEBHOOK ERROR:",
