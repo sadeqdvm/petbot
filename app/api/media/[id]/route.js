@@ -1,0 +1,2 @@
+import axios from 'axios';
+export async function GET(_, { params }) { const { data } = await axios.get(`https://graph.facebook.com/v22.0/${params.id}`, { headers: { Authorization: `Bearer ${process.env.META_WHATSAPP_ACCESS_TOKEN}` } }); const media = await axios.get(data.url, { responseType:'arraybuffer', headers: { Authorization: `Bearer ${process.env.META_WHATSAPP_ACCESS_TOKEN}` } }); return new Response(media.data, { headers: { 'Content-Type': media.headers['content-type'] || 'application/octet-stream' } }); }
