@@ -8,16 +8,20 @@ const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
-// Vet/Admin number
-// Format WITHOUT "+"
+// Admin/Vet number (without +)
 const VET_NUMBER = "8801721417598";
 
 // ======================================================
-// TEMP MEMORY STORAGE (MVP)
-// Later replace with MongoDB/Firebase
+// TEMP MEMORY STORAGE
+// NOTE:
+// Vercel memory resets sometimes.
+// Use MongoDB later for production.
 // ======================================================
 
 const users = {};
+
+// Prevent duplicate webhook processing
+const processedMessages = new Set();
 
 // ======================================================
 // SEND WHATSAPP MESSAGE
@@ -83,7 +87,7 @@ ${user.temperature}
 }
 
 // ======================================================
-// EMERGENCY DETECTION
+// EMERGENCY CHECK
 // ======================================================
 
 function isEmergency(text) {
@@ -260,7 +264,6 @@ async function handleMessage(userId, message, type) {
 
     case "WAIT_PAYMENT":
 
-      // Image = payment screenshot
       if (type === "image") {
 
         user.paid = true;
@@ -286,14 +289,14 @@ async function handleMessage(userId, message, type) {
       break;
 
     // ==================================================
-    // DOCTOR HANDOVER
+    // DOCTOR MODE
     // ==================================================
 
     case "DOCTOR":
 
       console.log(`Doctor takeover active for ${userId}`);
 
-      // Bot stops here
+      // Bot stops responding
       break;
 
     // ==================================================
@@ -304,7 +307,7 @@ async function handleMessage(userId, message, type) {
 
       await sendMessage(
         userId,
-        "ধন্যবাদ ❤️\n\nপ্রয়োজনে আবার যোগাযোগ করুন।"
+        "ধন্যবাদ ❤️"
       );
 
       break;
@@ -323,7 +326,7 @@ async function handleMessage(userId, message, type) {
       );
   }
 
-  // Save state
+  // Save user state
   users[userId] = user;
 
   console.log("UPDATED USER:");
@@ -346,7 +349,7 @@ module.exports = async (req, res) => {
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
 
-    console.log("Webhook verification request");
+    console.log("Verification request received");
 
     if (
       mode === "subscribe" &&
@@ -358,7 +361,7 @@ module.exports = async (req, res) => {
       return res.status(200).send(challenge);
     }
 
-    console.log("Webhook verification failed");
+    console.log("Verification failed");
 
     return res.sendStatus(403);
   }
@@ -371,30 +374,19 @@ module.exports = async (req, res) => {
 
     try {
 
-      console.log(
-        "Incoming Webhook:",
-        JSON.stringify(req.body, null, 2)
-      );
-
       const entry = req.body.entry?.[0];
       const changes = entry?.changes?.[0];
       const value = changes?.value;
 
-      // ================================================
-      // IGNORE STATUS EVENTS
-      // ================================================
-
+      // Ignore status updates
       if (value?.statuses) {
 
-        console.log("Ignoring status event");
+        console.log("Ignoring status update");
 
         return res.sendStatus(200);
       }
 
-      // ================================================
-      // IGNORE EMPTY EVENTS
-      // ================================================
-
+      // Ignore empty events
       if (!value?.messages) {
 
         console.log("No messages found");
@@ -403,12 +395,8 @@ module.exports = async (req, res) => {
       }
 
       const message = value.messages[0];
-     
-	  
-      // ================================================
-      // IGNORE INVALID EVENTS
-      // ================================================
 
+      // Ignore invalid events
       if (!message || !message.from) {
 
         console.log("Invalid message");
@@ -416,13 +404,21 @@ module.exports = async (req, res) => {
         return res.sendStatus(200);
       }
 
+      const messageId = message.id;
+
+      // Prevent duplicate processing
+      if (processedMessages.has(messageId)) {
+
+        console.log("Duplicate message ignored");
+
+        return res.sendStatus(200);
+      }
+
+      processedMessages.add(messageId);
+
       const from = message.from;
 
-      // ================================================
-      // IGNORE VET/ADMIN MESSAGES
-      // Prevent infinite loop
-      // ================================================
-
+      // Ignore vet/admin messages
       if (from === VET_NUMBER) {
 
         console.log("Ignoring vet/admin message");
@@ -434,28 +430,19 @@ module.exports = async (req, res) => {
 
       let text = "";
 
-      // ================================================
-      // TEXT MESSAGE
-      // ================================================
-
+      // Text message
       if (type === "text") {
 
         text = message.text?.body || "";
       }
 
-      // ================================================
-      // IMAGE MESSAGE
-      // ================================================
-
+      // Image message
       else if (type === "image") {
 
         text = "image";
       }
 
-      // ================================================
-      // UNSUPPORTED MESSAGE
-      // ================================================
-
+      // Unsupported type
       else {
 
         console.log("Unsupported message type");
@@ -469,11 +456,26 @@ module.exports = async (req, res) => {
       console.log("TEXT:", text);
       console.log("================================");
 
-      // Respond to Meta IMMEDIATELY
+      // VERY IMPORTANT:
+      // Reply to Meta immediately
       res.sendStatus(200);
-      
-      // Process asynchronously
-      handleMessage(from, text, type);
+
+      // Process async AFTER response
+      setImmediate(async () => {
+
+        try {
+
+          await handleMessage(from, text, type);
+
+        } catch (err) {
+
+          console.error(
+            "HANDLE MESSAGE ERROR:",
+            err
+          );
+        }
+
+      });
 
     } catch (error) {
 
@@ -484,6 +486,8 @@ module.exports = async (req, res) => {
 
       return res.sendStatus(500);
     }
+
+    return;
   }
 
   // ====================================================
